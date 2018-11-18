@@ -167,6 +167,11 @@ public class MergeParity extends BinFiles {
     }
 
     @Override
+    protected FlowFile preprocessFlowFile(ProcessContext processContext, ProcessSession processSession, FlowFile flowFile) {
+        return flowFile;
+    }
+
+    @Override
     protected String getGroupId(ProcessContext processContext, FlowFile flowFile, ProcessSession processSession) {
         final String correlationAttributeName = processContext.getProperty(CORRELATION_ATTRIBUTE_NAME)
                 .evaluateAttributeExpressions(flowFile).getValue();
@@ -205,7 +210,7 @@ public class MergeParity extends BinFiles {
         }
 
         Collections.sort(contents, new FragmentComparator());
-        FlowFile bundle = merger.merge(bin, context);
+        FlowFile bundle = merger.merge(bin, processContext);
 
         // keep the filename, as it is added to the bundle.
         final String filename = bundle.getAttribute(CoreAttributes.FILENAME.key());
