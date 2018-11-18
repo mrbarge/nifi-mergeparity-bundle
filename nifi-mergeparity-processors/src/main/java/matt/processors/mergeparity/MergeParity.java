@@ -26,19 +26,32 @@ import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
+import org.apache.nifi.flowfile.attributes.FragmentAttributes;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.processor.io.InputStreamCallback;
+import org.apache.nifi.processor.io.OutputStreamCallback;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.processor.util.bin.Bin;
+import org.apache.nifi.processor.util.bin.BinFiles;
+import org.apache.nifi.processor.util.bin.BinManager;
+import org.apache.nifi.processor.util.bin.BinProcessingResult;
+import org.apache.nifi.stream.io.StreamUtils;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 @Tags({"example"})
 @CapabilityDescription("Provide a description")
@@ -66,7 +79,15 @@ import java.util.Set;
                 + "this is the greatest amount of time that any FlowFile in this bundle remained waiting in this processor before it was output"),
         @WritesAttribute(attribute = "merge.uuid", description = "UUID of the merged flow file that will be added to the original flow files attributes.")
 })
-public class MergeParity extends AbstractProcessor {
+public class MergeParity extends BinFiles {
+
+    public static final String FRAGMENT_ID_ATTRIBUTE = FragmentAttributes.FRAGMENT_ID.key();
+    public static final String FRAGMENT_INDEX_ATTRIBUTE = FragmentAttributes.FRAGMENT_INDEX.key();
+    public static final String FRAGMENT_COUNT_ATTRIBUTE = FragmentAttributes.FRAGMENT_COUNT.key();
+
+    // old style attributes
+    public static final String SEGMENT_ORIGINAL_FILENAME = FragmentAttributes.SEGMENT_ORIGINAL_FILENAME.key();
+
 
     public static final PropertyDescriptor DATA_SHARDS = new PropertyDescriptor
             .Builder().name("DATA_SHARDS")
@@ -97,6 +118,8 @@ public class MergeParity extends AbstractProcessor {
             .description("Failed flow files.")
             .build();
 
+    public static final Pattern NUMBER_PATTERN = Pattern.compile("\\d+");
+
     private List<PropertyDescriptor> descriptors;
 
     private Set<Relationship> relationships;
@@ -125,17 +148,227 @@ public class MergeParity extends AbstractProcessor {
         return descriptors;
     }
 
-    @OnScheduled
-    public void onScheduled(final ProcessContext context) {
+    @Override
+    protected FlowFile preprocessFlowFile(ProcessContext processContext, ProcessSession processSession, FlowFile flowFile) {
+        return null;
+    }
+
+    @Override
+    protected String getGroupId(ProcessContext processContext, FlowFile flowFile, ProcessSession processSession) {
+        return null;
+    }
+
+    @Override
+    protected void setUpBinManager(BinManager binManager, ProcessContext processContext) {
 
     }
 
     @Override
-    public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
-        FlowFile flowFile = session.get();
-        if ( flowFile == null ) {
-            return;
+    protected BinProcessingResult processBin(Bin bin, ProcessContext processContext) throws ProcessException {
+        final BinProcessingResult binProcessingResult = new BinProcessingResult(true);
+        MergeBin merger = new BinaryConcatenationMerge();
+        final List<FlowFile> contents = bin.getContents();
+        final ProcessSession binSession = bin.getSession();
+
+        final String error = getDefragmentValidationError(bin.getContents());
+
+        // Fail the flow files and commit them
+        if (error != null) {
+            final String binDescription = contents.size() <= 10 ? contents.toString() : contents.size() + " FlowFiles";
+            getLogger().error(error + "; routing {} to failure", new Object[]{binDescription});
+            binSession.transfer(contents, REL_FAILURE);
+            binSession.commit();
+            return binProcessingResult;
         }
-        // TODO implement
+
+        Collections.sort(contents, new FragmentComparator());
+        FlowFile bundle = merger.merge(bin, context);
+
+        // keep the filename, as it is added to the bundle.
+        final String filename = bundle.getAttribute(CoreAttributes.FILENAME.key());
+
+        // merge all of the attributes
+        final Map<String, String> bundleAttributes = attributeStrategy.getMergedAttributes(contents);
+        bundleAttributes.put(CoreAttributes.MIME_TYPE.key(), merger.getMergedContentType());
+        // restore the filename of the bundle
+        bundleAttributes.put(CoreAttributes.FILENAME.key(), filename);
+        bundleAttributes.put(MERGE_COUNT_ATTRIBUTE, Integer.toString(contents.size()));
+        bundleAttributes.put(MERGE_BIN_AGE_ATTRIBUTE, Long.toString(bin.getBinAge()));
+
+        bundle = binSession.putAllAttributes(bundle, bundleAttributes);
+
+        final String inputDescription = contents.size() < 10 ? contents.toString() : contents.size() + " FlowFiles";
+        getLogger().info("Merged {} into {}", new Object[]{inputDescription, bundle});
+        binSession.transfer(bundle, REL_MERGED);
+        binProcessingResult.getAttributes().put(MERGE_UUID_ATTRIBUTE, bundle.getAttribute(CoreAttributes.UUID.key()));
+
+        for (final FlowFile unmerged : merger.getUnmergedFlowFiles()) {
+            final FlowFile unmergedCopy = binSession.clone(unmerged);
+            binSession.transfer(unmergedCopy, REL_FAILURE);
+        }
+
+        // We haven't committed anything, parent will take care of it
+        binProcessingResult.setCommitted(false);
+        return binProcessingResult;
+
     }
+
+    private String getDefragmentValidationError(final List<FlowFile> binContents) {
+        if (binContents.isEmpty()) {
+            return null;
+        }
+
+        // If we are defragmenting, all fragments must have the appropriate attributes.
+        String decidedFragmentCount = null;
+        String fragmentIdentifier = null;
+        for (final FlowFile flowFile : binContents) {
+            final String fragmentIndex = flowFile.getAttribute(FRAGMENT_INDEX_ATTRIBUTE);
+            if (!isNumber(fragmentIndex)) {
+                return "Cannot Defragment " + flowFile + " because it does not have an integer value for the " + FRAGMENT_INDEX_ATTRIBUTE + " attribute";
+            }
+
+            fragmentIdentifier = flowFile.getAttribute(FRAGMENT_ID_ATTRIBUTE);
+
+            final String fragmentCount = flowFile.getAttribute(FRAGMENT_COUNT_ATTRIBUTE);
+            if (!isNumber(fragmentCount)) {
+                return "Cannot Defragment " + flowFile + " because it does not have an integer value for the " + FRAGMENT_COUNT_ATTRIBUTE + " attribute";
+            } else if (decidedFragmentCount == null) {
+                decidedFragmentCount = fragmentCount;
+            } else if (!decidedFragmentCount.equals(fragmentCount)) {
+                return "Cannot Defragment " + flowFile + " because it is grouped with another FlowFile, and the two have differing values for the "
+                        + FRAGMENT_COUNT_ATTRIBUTE + " attribute: " + decidedFragmentCount + " and " + fragmentCount;
+            }
+        }
+
+        final int numericFragmentCount;
+        try {
+            numericFragmentCount = Integer.parseInt(decidedFragmentCount);
+        } catch (final NumberFormatException nfe) {
+            return "Cannot Defragment FlowFiles with Fragment Identifier " + fragmentIdentifier + " because the " + FRAGMENT_COUNT_ATTRIBUTE + " has a non-integer value of " + decidedFragmentCount;
+        }
+
+        if (binContents.size() < numericFragmentCount) {
+            return "Cannot Defragment FlowFiles with Fragment Identifier " + fragmentIdentifier + " because the expected number of fragments is " + decidedFragmentCount + " but found only "
+                    + binContents.size() + " fragments";
+        }
+
+        if (binContents.size() > numericFragmentCount) {
+            return "Cannot Defragment FlowFiles with Fragment Identifier " + fragmentIdentifier + " because the expected number of fragments is " + decidedFragmentCount + " but found "
+                    + binContents.size() + " fragments for this identifier";
+        }
+
+        return null;
+    }
+
+    private byte[] readContent(final String filename) throws IOException {
+        return Files.readAllBytes(Paths.get(filename));
+    }
+
+    private boolean isNumber(final String value) {
+        if (value == null) {
+            return false;
+        }
+
+        return NUMBER_PATTERN.matcher(value).matches();
+    }
+
+    private String createFilename(final List<FlowFile> flowFiles) {
+        if (flowFiles.size() == 1) {
+            return flowFiles.get(0).getAttribute(CoreAttributes.FILENAME.key());
+        } else {
+            final FlowFile ff = flowFiles.get(0);
+            final String origFilename = ff.getAttribute(SEGMENT_ORIGINAL_FILENAME);
+            if (origFilename != null) {
+                return origFilename;
+            } else {
+                return String.valueOf(System.nanoTime());
+            }
+        }
+    }
+
+    private interface MergeBin {
+
+        FlowFile merge(Bin bin, ProcessContext context);
+
+        String getMergedContentType();
+
+        List<FlowFile> getUnmergedFlowFiles();
+    }
+
+    private class BinaryConcatenationMerge implements MergeBin {
+
+        private String mimeType = "application/octet-stream";
+
+        public BinaryConcatenationMerge() {
+        }
+
+        @Override
+        public FlowFile merge(final Bin bin, final ProcessContext context) {
+            final List<FlowFile> contents = bin.getContents();
+
+            final ProcessSession session = bin.getSession();
+            FlowFile bundle = session.create(bin.getContents());
+            final AtomicReference<String> bundleMimeTypeRef = new AtomicReference<>(null);
+            try {
+                bundle = session.write(bundle, new OutputStreamCallback() {
+                    @Override
+                    public void process(final OutputStream out) throws IOException {
+                        boolean isFirst = true;
+                        final Iterator<FlowFile> itr = contents.iterator();
+                        while (itr.hasNext()) {
+                            final FlowFile flowFile = itr.next();
+                            bin.getSession().read(flowFile, false, new InputStreamCallback() {
+                                @Override
+                                public void process(final InputStream in) throws IOException {
+                                    StreamUtils.copy(in, out);
+                                }
+                            });
+
+                            final String flowFileMimeType = flowFile.getAttribute(CoreAttributes.MIME_TYPE.key());
+                            if (isFirst) {
+                                bundleMimeTypeRef.set(flowFileMimeType);
+                                isFirst = false;
+                            } else {
+                                if (bundleMimeTypeRef.get() != null && !bundleMimeTypeRef.get().equals(flowFileMimeType)) {
+                                    bundleMimeTypeRef.set(null);
+                                }
+                            }
+                        }
+                    }
+                });
+            } catch (final Exception e) {
+                session.remove(bundle);
+                throw e;
+            }
+
+            session.getProvenanceReporter().join(contents, bundle);
+            bundle = session.putAttribute(bundle, CoreAttributes.FILENAME.key(), createFilename(contents));
+            if (bundleMimeTypeRef.get() != null) {
+                this.mimeType = bundleMimeTypeRef.get();
+            }
+
+            return bundle;
+        }
+
+        @Override
+        public String getMergedContentType() {
+            return mimeType;
+        }
+
+        @Override
+        public List<FlowFile> getUnmergedFlowFiles() {
+            return Collections.emptyList();
+        }
+    }
+
+    private static class FragmentComparator implements Comparator<FlowFile> {
+
+        @Override
+        public int compare(final FlowFile o1, final FlowFile o2) {
+            final int fragmentIndex1 = Integer.parseInt(o1.getAttribute(FRAGMENT_INDEX_ATTRIBUTE));
+            final int fragmentIndex2 = Integer.parseInt(o2.getAttribute(FRAGMENT_INDEX_ATTRIBUTE));
+            return Integer.compare(fragmentIndex1, fragmentIndex2);
+        }
+    }
+
 }
