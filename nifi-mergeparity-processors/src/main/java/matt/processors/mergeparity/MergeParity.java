@@ -16,7 +16,9 @@
  */
 package matt.processors.mergeparity;
 
+import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.annotation.behavior.ReadsAttribute;
 import org.apache.nifi.annotation.behavior.ReadsAttributes;
@@ -41,6 +43,8 @@ import org.apache.nifi.processor.util.bin.Bin;
 import org.apache.nifi.processor.util.bin.BinFiles;
 import org.apache.nifi.processor.util.bin.BinManager;
 import org.apache.nifi.processor.util.bin.BinProcessingResult;
+import org.apache.nifi.processors.standard.merge.AttributeStrategy;
+import org.apache.nifi.processors.standard.merge.AttributeStrategyUtil;
 import org.apache.nifi.stream.io.StreamUtils;
 
 import java.io.IOException;
@@ -118,6 +122,20 @@ public class MergeParity extends BinFiles {
             .description("Failed flow files.")
             .build();
 
+    public static final PropertyDescriptor CORRELATION_ATTRIBUTE_NAME = new PropertyDescriptor.Builder()
+            .name("Correlation Attribute Name")
+            .description("If specified, like FlowFiles will be binned together, where 'like FlowFiles' means FlowFiles that have the same value for "
+                    + "this Attribute. If not specified, FlowFiles are bundled by the order in which they are pulled from the queue.")
+            .required(false)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(StandardValidators.ATTRIBUTE_KEY_VALIDATOR)
+            .defaultValue(null)
+            .build();
+
+    public static final String MERGE_COUNT_ATTRIBUTE = "merge.count";
+    public static final String MERGE_BIN_AGE_ATTRIBUTE = "merge.bin.age";
+    public static final String MERGE_UUID_ATTRIBUTE = "merge.uuid";
+
     public static final Pattern NUMBER_PATTERN = Pattern.compile("\\d+");
 
     private List<PropertyDescriptor> descriptors;
@@ -149,24 +167,29 @@ public class MergeParity extends BinFiles {
     }
 
     @Override
-    protected FlowFile preprocessFlowFile(ProcessContext processContext, ProcessSession processSession, FlowFile flowFile) {
-        return null;
-    }
-
-    @Override
     protected String getGroupId(ProcessContext processContext, FlowFile flowFile, ProcessSession processSession) {
-        return null;
+        final String correlationAttributeName = processContext.getProperty(CORRELATION_ATTRIBUTE_NAME)
+                .evaluateAttributeExpressions(flowFile).getValue();
+        String groupId = correlationAttributeName == null ? null : flowFile.getAttribute(correlationAttributeName);
+
+        // when MERGE_STRATEGY is Defragment and correlationAttributeName is null then bin by fragment.identifier
+        if (groupId == null) {
+            groupId = flowFile.getAttribute(FRAGMENT_ID_ATTRIBUTE);
+        }
+
+        return groupId;
     }
 
     @Override
     protected void setUpBinManager(BinManager binManager, ProcessContext processContext) {
-
+        binManager.setFileCountAttribute(FRAGMENT_COUNT_ATTRIBUTE);
     }
 
     @Override
     protected BinProcessingResult processBin(Bin bin, ProcessContext processContext) throws ProcessException {
         final BinProcessingResult binProcessingResult = new BinProcessingResult(true);
         MergeBin merger = new BinaryConcatenationMerge();
+        final AttributeStrategy attributeStrategy = AttributeStrategyUtil.strategyFor(processContext);
         final List<FlowFile> contents = bin.getContents();
         final ProcessSession binSession = bin.getSession();
 
@@ -287,11 +310,8 @@ public class MergeParity extends BinFiles {
     }
 
     private interface MergeBin {
-
         FlowFile merge(Bin bin, ProcessContext context);
-
         String getMergedContentType();
-
         List<FlowFile> getUnmergedFlowFiles();
     }
 
