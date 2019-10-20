@@ -61,6 +61,7 @@ import java.util.regex.Pattern;
 @CapabilityDescription("Provide a description")
 @ReadsAttributes({
         @ReadsAttribute(attribute = "fragment.identifier", description = "All FlowFiles with the same value for this attribute will be bundled together."),
+        @ReadsAttribute(attribute = "fragment.count", description = "Number of possible fragments that were sent."),
         @ReadsAttribute(attribute = "fragment.index", description = "This attribute indicates the order in which the fragments should be assembled. This "
                 + "attribute must be present on all FlowFiles and must be a unique (i.e., unique across all "
                 + "FlowFiles that have the same value for the \"fragment.identifier\" attribute) integer "
@@ -91,23 +92,6 @@ public class MergeParity extends BinFiles {
 
     // old style attributes
     public static final String SEGMENT_ORIGINAL_FILENAME = FragmentAttributes.SEGMENT_ORIGINAL_FILENAME.key();
-
-
-    public static final PropertyDescriptor DATA_SHARDS = new PropertyDescriptor
-            .Builder().name("DATA_SHARDS")
-            .displayName("Data Shards")
-            .description("Number of Data Shards to split the file into.")
-            .required(false)
-            .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
-            .build();
-
-    public static final PropertyDescriptor PARITY_SHARDS = new PropertyDescriptor
-            .Builder().name("PARITY_SHARDS")
-            .displayName("Parity Shards")
-            .description("Number of Parity Shards to generate for the file.")
-            .required(false)
-            .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
-            .build();
 
     static final Relationship REL_MERGED = new Relationship.Builder()
             .name("merged")
@@ -145,8 +129,6 @@ public class MergeParity extends BinFiles {
     @Override
     protected void init(final ProcessorInitializationContext context) {
         final List<PropertyDescriptor> descriptors = new ArrayList<>();
-        descriptors.add(DATA_SHARDS);
-        descriptors.add(PARITY_SHARDS);
         this.descriptors = Collections.unmodifiableList(descriptors);
 
         final Set<Relationship> relationships = new HashSet<>();
