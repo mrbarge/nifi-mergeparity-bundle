@@ -44,14 +44,17 @@ import org.apache.nifi.processors.standard.merge.AttributeStrategy;
 import org.apache.nifi.processors.standard.merge.AttributeStrategyUtil;
 import org.apache.nifi.stream.io.StreamUtils;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
+import com.backblaze.erasure.ReedSolomon;
 
 @Tags({"example"})
 @CapabilityDescription("Provide a description")
@@ -87,7 +90,6 @@ public class MergeParity extends BinFiles {
     public static final String FRAGMENT_ID_ATTRIBUTE = FragmentAttributes.FRAGMENT_ID.key();
     public static final String FRAGMENT_INDEX_ATTRIBUTE = FragmentAttributes.FRAGMENT_INDEX.key();
     public static final String FRAGMENT_COUNT_ATTRIBUTE = FragmentAttributes.FRAGMENT_COUNT.key();
-
     public static final String FRAGMENT_DATA_COUNT = "fragment.data.count";
     public static final String FRAGMENT_PARITY_COUNT = "fragment.parity.count";
 
@@ -206,6 +208,7 @@ public class MergeParity extends BinFiles {
             return binProcessingResult;
         }
 
+        Collections.sort(contents);
         FlowFile bundle = merger.merge(bin, processContext);
 
         // keep the filename, as it is added to the bundle.
@@ -338,24 +341,72 @@ public class MergeParity extends BinFiles {
         @Override
         public FlowFile merge(final Bin bin, final ProcessContext context) {
             final List<FlowFile> contents = bin.getContents();
+            final Iterator<FlowFile> itr = contents.iterator();
 
-            // Get the first
-            // Firstly check that the bin has enough data shards
             final ProcessSession session = bin.getSession();
-            FlowFile bundle = session.create(bin.getContents());
+            final int totalShards = Integer.getInteger(contents.get(0).getAttribute(FRAGMENT_COUNT_ATTRIBUTE));
+            final int dataShardSize = Integer.getInteger(contents.get(0).getAttribute(FRAGMENT_DATA_COUNT));
+            final int parityShardSize  = Integer.getInteger(contents.get(0).getAttribute(FRAGMENT_PARITY_COUNT));
+//            final int dataShardsSize = context.getProperty(DATA_SHARDS).asInteger();
+
+            AtomicBoolean error = new AtomicBoolean();
+            FlowFile outputFlowFile = session.create();
+
             try {
-                bundle = session.write(bundle, new OutputStreamCallback() {
 
-                    @Override
-                    public void process(OutputStream outputStream) throws IOException {
+                final byte[][] shards = new byte[totalShards][];
+
+                final boolean[] shardPresent = new boolean[totalShards];
+                int shardSize = 0;
+                int shardCount = 0;
+                int fragmentIdx = 0;
+                while (itr.hasNext()) {
+                    final FlowFile flowFile = itr.next();
+                    int flowFragmentIdx = Integer.getInteger(flowFile.getAttribute(FRAGMENT_INDEX_ATTRIBUTE));
+
+                    if (fragmentIdx == flowFragmentIdx) {
+                        // A fragment was received
+                        shardSize = (int) flowFile.getSize();
+                        shards[fragmentIdx] = new byte[shardSize];
+                        shardPresent[fragmentIdx] = true;
+                        shardCount += 1;
+
+                        final ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+                        session.exportTo(flowFile, byteStream);
+                        byte[] tmpBytes = byteStream.toByteArray();
+                        System.arraycopy(tmpBytes, 0, shards[fragmentIdx], 0, tmpBytes.length);
                     }
-                });
-            } catch (final Exception e) {
-                session.remove(bundle);
-                throw e;
-            }
+                }
 
-            return bundle;
+                // We need at least DATA_SHARDS to be able to reconstruct the file.
+                if (shardCount < dataShardSize) {
+                    error.set(true);
+                    getLogger().error("Not enough shards present.");
+                }
+
+                // Make empty buffers for the missing shards.
+                for (int i = 0; i < totalShards; i++) {
+                    if (!shardPresent[i]) {
+                        shards[i] = new byte[shardSize];
+                    }
+                }
+
+                // Use Reed-Solomon to fill in the missing shards
+                ReedSolomon reedSolomon = ReedSolomon.create(dataShardSize, parityShardSize);
+                reedSolomon.decodeMissing(shards, shardPresent, 0, shardSize);
+
+                // Combine the data shards into one buffer for convenience.
+                // (This is not efficient, but it is convenient.)
+                byte[] allBytes = new byte[shardSize * dataShardSize];
+                for (int i = 0; i < dataShardSize; i++) {
+                    System.arraycopy(shards[i], 0, allBytes, shardSize * i, shardSize);
+                }
+
+                session.write(outputFlowFile, out -> out.write(allBytes));
+            } catch (Exception e) {
+                error.set(true);
+            }
+            return outputFlowFile;
         }
 
         @Override
@@ -369,67 +420,14 @@ public class MergeParity extends BinFiles {
         }
     }
 
-//    private class BinaryConcatenationMerge implements MergeBin {
-//
-//        private String mimeType = "application/octet-stream";
-//
-//        @Override
-//        public FlowFile merge(final Bin bin, final ProcessContext context) {
-//            final List<FlowFile> contents = bin.getContents();
-//
-//            final ProcessSession session = bin.getSession();
-//            FlowFile bundle = session.create(bin.getContents());
-//            final AtomicReference<String> bundleMimeTypeRef = new AtomicReference<>(null);
-//            try {
-//                bundle = session.write(bundle, new OutputStreamCallback() {
-//                    @Override
-//                    public void process(final OutputStream out) throws IOException {
-//                        boolean isFirst = true;
-//                        final Iterator<FlowFile> itr = contents.iterator();
-//                        while (itr.hasNext()) {
-//                            final FlowFile flowFile = itr.next();
-//                            bin.getSession().read(flowFile, false, new InputStreamCallback() {
-//                                @Override
-//                                public void process(final InputStream in) throws IOException {
-//                                    StreamUtils.copy(in, out);
-//                                }
-//                            });
-//
-//                            final String flowFileMimeType = flowFile.getAttribute(CoreAttributes.MIME_TYPE.key());
-//                            if (isFirst) {
-//                                bundleMimeTypeRef.set(flowFileMimeType);
-//                                isFirst = false;
-//                            } else {
-//                                if (bundleMimeTypeRef.get() != null && !bundleMimeTypeRef.get().equals(flowFileMimeType)) {
-//                                    bundleMimeTypeRef.set(null);
-//                                }
-//                            }
-//                        }
-//                    }
-//                });
-//            } catch (final Exception e) {
-//                session.remove(bundle);
-//                throw e;
-//            }
-//
-//            session.getProvenanceReporter().join(contents, bundle);
-//            bundle = session.putAttribute(bundle, CoreAttributes.FILENAME.key(), createFilename(contents));
-//            if (bundleMimeTypeRef.get() != null) {
-//                this.mimeType = bundleMimeTypeRef.get();
-//            }
-//
-//            return bundle;
-//        }
-//
-//        @Override
-//        public String getMergedContentType() {
-//            return mimeType;
-//        }
-//
-//        @Override
-//        public List<FlowFile> getUnmergedFlowFiles() {
-//            return Collections.emptyList();
-//        }
-//    }
+    private static class FragmentComparator implements Comparator<FlowFile> {
 
+        @Override
+        public int compare(final FlowFile o1, final FlowFile o2) {
+            final int fragmentIndex1 = Integer.parseInt(o1.getAttribute(FRAGMENT_INDEX_ATTRIBUTE));
+            final int fragmentIndex2 = Integer.parseInt(o2.getAttribute(FRAGMENT_INDEX_ATTRIBUTE));
+            return Integer.compare(fragmentIndex1, fragmentIndex2);
+        }
+    }
+    
 }
